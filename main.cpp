@@ -122,6 +122,7 @@ int main() {
     
     //Initialise the serial port
     Serial pc(SERIAL_TX, SERIAL_RX);
+    pc.printf("\n");
     pc.printf("Hello\n\r");
     
     //Run the motor synchronisation
@@ -153,27 +154,28 @@ int main() {
     uint64_t* nonce = (uint64_t*)((int)sequence + 56); 
     uint8_t hash[32];
     int counter = 0;
-    
-    pc.printf("can this work please.");
+    uint64_t num = 0;
     
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
         
         //Use the computeHash() method of SHA256 to calculate the hashes
-        sha256.computeHash(hash, sequence ,64);
+        sha256.computeHash(hash, sequence, 64);
         counter++;
-        //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
-        *nonce++;
-        
+
         //Test for both hash[0] and hash[1] equal to zero to indicate a successful ‘nonce’
+        t.start();
         float startTime = t.read();
-        if(hash[0] == 0x00 &&  hash[1] == 0x00) {
+        if(hash[0] == 0 &&  hash[1] == 0) {
             pc.printf("nonce: ");
-            for(int i = 0; i < 8; ++i)
-                pc.printf("%02x", nonce[i]);
-            pc.printf("\n");
+            for(int i = 0; i < 32; ++i)
+                pc.printf("%02x ", (((uint8_t*)hash)[i]));
+            pc.printf("\n\r");
         }
-    
+        
+        //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
+        (*nonce)++;
+
         //Every second, report the current computation rate
         float elapsedTime = t.read() - startTime;
         if(elapsedTime >= 1){
@@ -181,9 +183,11 @@ int main() {
             pc.printf("Computation Rate = ");
             pc.printf("%d", computationRate);
             pc.printf(" Hashes per sec");
+            t.reset();
             startTime = t.read();
             counter = 0;
         }    
     }
 }
+
 
