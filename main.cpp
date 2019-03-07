@@ -28,10 +28,27 @@
 //MBED timer class
 Timer t; 
 
-//Rotot offset at motor state 0
+//Rotor offset at motor state 0
 int8_t orState = 0;    
 int8_t intState = 0;
 int8_t intStateOld = 0;
+
+//Create an instance of the class SHA256 
+SHA256 sha256;
+    
+//Declare and initialise the input sequence and hash 
+uint8_t sequence[] = {0x45,0x6D,0x62,0x65,0x64,0x64,0x65,0x64, 
+    0x20,0x53,0x79,0x73,0x74,0x65,0x6D,0x73, 
+    0x20,0x61,0x72,0x65,0x20,0x66,0x75,0x6E, 
+    0x20,0x61,0x6E,0x64,0x20,0x64,0x6F,0x20, 
+    0x61,0x77,0x65,0x73,0x6F,0x6D,0x65,0x20, 
+    0x74,0x68,0x69,0x6E,0x67,0x73,0x21,0x20, 
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+uint64_t* key = (uint64_t*)((int)sequence + 48); 
+uint64_t* nonce = (uint64_t*)((int)sequence + 56); 
+uint8_t hash[32];
+int counter = 0;
 
 //Mapping from sequential drive states to motor phase outputs
 /*
@@ -55,6 +72,14 @@ const int8_t stateMap[] = {0x07,0x05,0x03,0x04,0x01,0x00,0x02,0x07};
 //Phase lead to make motor spin
 const int8_t lead = 2;  //2 for forwards, -2 for backwards
 
+//Mailbox structure
+typedef struct {
+  uint64_t* nonce; 
+  //int i;           
+} mail_t;
+
+Mail<mail_t, 16> mail_box;
+
 //Status LED
 DigitalOut led1(LED1);
 
@@ -62,6 +87,9 @@ DigitalOut led1(LED1);
 InterruptIn I1(I1pin);
 InterruptIn I2(I2pin);
 InterruptIn I3(I3pin);
+
+//Thread for outgoing communication tasks
+Thread thread;
 
 //Motor Drive outputs
 DigitalOut L1L(L1Lpin);
@@ -117,6 +145,15 @@ void motorPosition() {
          //pc.printf("%d\n\r",intState);
          }
 }
+
+void send_thread(void) {
+    mail_t *mail = mail_box.alloc();
+    mail->nonce = nonce;
+    //mail->i = 1;
+    mail_box.put(mail);
+    wait(1);
+}
+
 //Main
 int main() {
     
@@ -138,23 +175,7 @@ int main() {
     I2.fall(&motorPosition);
     I3.fall(&motorPosition);
     
-    //Create an instance of the class SHA256 
-    SHA256 sha256;
-    
-    //Declare and initialise the input sequence and hash 
-    uint8_t sequence[] = {0x45,0x6D,0x62,0x65,0x64,0x64,0x65,0x64, 
-        0x20,0x53,0x79,0x73,0x74,0x65,0x6D,0x73, 
-        0x20,0x61,0x72,0x65,0x20,0x66,0x75,0x6E, 
-        0x20,0x61,0x6E,0x64,0x20,0x64,0x6F,0x20, 
-        0x61,0x77,0x65,0x73,0x6F,0x6D,0x65,0x20, 
-        0x74,0x68,0x69,0x6E,0x67,0x73,0x21,0x20, 
-        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, 
-        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
-    uint64_t* key = (uint64_t*)((int)sequence + 48); 
-    uint64_t* nonce = (uint64_t*)((int)sequence + 56); 
-    uint8_t hash[32];
-    int counter = 0;
-    uint64_t num = 0;
+    thread.start(callback(send_thread));
     
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
@@ -162,21 +183,26 @@ int main() {
         //Use the computeHash() method of SHA256 to calculate the hashes
         sha256.computeHash(hash, sequence, 64);
         counter++;
-
+        
         //Test for both hash[0] and hash[1] equal to zero to indicate a successful ‘nonce’
         t.start();
         float startTime = t.read();
         if(hash[0] == 0 &&  hash[1] == 0) {
-            pc.printf("nonce: ");
-            for(int i = 0; i < 8; ++i)
-                pc.printf("%02x ", (((uint8_t*)nonce)[i]));
-            pc.printf("\n\r");
+            osEvent evt = mail_box.get();
+            if (evt.status == osEventMail) {
+                mail_t *mail = (mail_t*)evt.value.p;
+                pc.printf("nonce: ");
+                uint64_t* receivedNonce = mail->nonce;
+                for(int i = 0; i < 8; ++i)
+                    pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
+            
+                mail_box.free(mail);
+            }
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
         (*nonce)++;
-        
-        // NOT PRINTING YET:
+
         //Every second, report the current computation rate
         float elapsedTime = t.read() - startTime;
         if(elapsedTime >= 1){
@@ -190,5 +216,3 @@ int main() {
         }    
     }
 }
-
-
