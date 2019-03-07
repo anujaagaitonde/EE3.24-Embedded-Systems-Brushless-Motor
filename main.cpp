@@ -168,14 +168,15 @@ int main() {
         float startTime = t.read();
         if(hash[0] == 0 &&  hash[1] == 0) {
             pc.printf("nonce: ");
-            for(int i = 0; i < 32; ++i)
-                pc.printf("%02x ", (((uint8_t*)hash)[i]));
+            for(int i = 0; i < 8; ++i)
+                pc.printf("%02x ", (((uint8_t*)nonce)[i]));
             pc.printf("\n\r");
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
         (*nonce)++;
-
+        
+        // NOT PRINTING YET:
         //Every second, report the current computation rate
         float elapsedTime = t.read() - startTime;
         if(elapsedTime >= 1){
