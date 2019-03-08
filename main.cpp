@@ -154,6 +154,20 @@ void send_thread(void) {
     wait(1);
 }
 
+void print_thread(void) {
+    while(true){
+        osEvent evt = mail_box.get();
+        if (evt.status == osEventMail) {
+            mail_t *mail = (mail_t*)evt.value.p;
+            pc.printf("nonce: ");
+            uint64_t* receivedNonce = mail->nonce;
+            for(int i = 0; i < 8; ++i){
+                pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
+            }
+        mail_box.free(mail);
+        }
+}
+
 //Main
 int main() {
     
@@ -175,7 +189,7 @@ int main() {
     I2.fall(&motorPosition);
     I3.fall(&motorPosition);
     
-    thread.start(callback(send_thread));
+    thread.start(callback(print_thread));
     
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
@@ -188,15 +202,7 @@ int main() {
         t.start();
         float startTime = t.read();
         if(hash[0] == 0 &&  hash[1] == 0) {
-            osEvent evt = mail_box.get();
-            if (evt.status == osEventMail) {
-                mail_t *mail = (mail_t*)evt.value.p;
-                pc.printf("nonce: ");
-                uint64_t* receivedNonce = mail->nonce;
-                for(int i = 0; i < 8; ++i)
-                    pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
-            
-                mail_box.free(mail);
+            send_thread();
             }
         }
         
