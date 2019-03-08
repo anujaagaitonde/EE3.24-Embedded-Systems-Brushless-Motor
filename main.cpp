@@ -74,8 +74,7 @@ const int8_t lead = 2;  //2 for forwards, -2 for backwards
 
 //Mailbox structure
 typedef struct {
-  uint64_t* nonce; 
-  //int i;           
+  uint64_t* nonce;           
 } mail_t;
 
 Mail<mail_t, 16> mail_box;
@@ -152,7 +151,6 @@ void motorPosition() {
 void send_thread(void) {
     mail_t *mail = mail_box.alloc();
     mail->nonce = nonce;
-    //mail->i = 1;
     mail_box.put(mail);
     wait(1);
 }
@@ -162,6 +160,7 @@ void print_thread(void) {
         osEvent evt = mail_box.get();
         if (evt.status == osEventMail) {
             mail_t *mail = (mail_t*)evt.value.p;
+            pc.printf("\n");
             pc.printf("nonce: ");
             uint64_t* receivedNonce = mail->nonce;
             for(int i = 0; i < 8; ++i){
