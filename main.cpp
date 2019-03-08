@@ -91,6 +91,9 @@ InterruptIn I3(I3pin);
 //Thread for outgoing communication tasks
 Thread thread;
 
+//Initialise the serial port
+Serial pc(SERIAL_TX, SERIAL_RX);
+
 //Motor Drive outputs
 DigitalOut L1L(L1Lpin);
 DigitalOut L1H(L1Hpin);
@@ -166,13 +169,12 @@ void print_thread(void) {
             }
         mail_box.free(mail);
         }
+    }
 }
 
 //Main
 int main() {
     
-    //Initialise the serial port
-    Serial pc(SERIAL_TX, SERIAL_RX);
     pc.printf("\n");
     pc.printf("Hello\n\r");
     
@@ -203,7 +205,6 @@ int main() {
         float startTime = t.read();
         if(hash[0] == 0 &&  hash[1] == 0) {
             send_thread();
-            }
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
@@ -222,3 +223,4 @@ int main() {
         }    
     }
 }
+
