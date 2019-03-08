@@ -160,7 +160,7 @@ void print_thread(void) {
         osEvent evt = mail_box.get();
         if (evt.status == osEventMail) {
             mail_t *mail = (mail_t*)evt.value.p;
-            pc.printf("\n");
+            pc.printf("\n\r");
             pc.printf("nonce: ");
             uint64_t* receivedNonce = mail->nonce;
             for(int i = 0; i < 8; ++i){
@@ -213,6 +213,7 @@ int main() {
         float elapsedTime = t.read() - startTime;
         if(elapsedTime >= 1){
             int computationRate = counter / elapsedTime;
+            pc.printf("\n\r");
             pc.printf("Computation Rate = ");
             pc.printf("%d", computationRate);
             pc.printf(" Hashes per sec");
