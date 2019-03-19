@@ -1,4 +1,5 @@
 #include "mbed.h"
+#include "rtos.h"
 #include "Crypto.h"
 #include "SHA256.h"
 #include "PwmOut.h"
@@ -71,15 +72,24 @@ int8_t lead = 2;
 // string output for user friendly representation -> can remove
 string movementDirection;
 
-//Mailbox structure for key
+// code options for input to mail_t structure
+enum dataCode {
+    ERROR1 = 0,
+    NONCE = 1,
+    KEY = 2,
+    VELOCITY = 3
+};
+
+//Mailbox structure
 typedef struct {
-    uint64_t* data;    
+    uint8_t code;
+    uint64_t data;    
 } mail_t;
 
-//Mailbox structure for motor control
-typedef struct {
-    string* data;
-} motor_t;
+//Initialise the serial port
+RawSerial pc(SERIAL_TX, SERIAL_RX);
+
+SHA256 sha256; //Create an instance of the class SHA256 
 
 //Status LED
 DigitalOut led1(LED1);
@@ -102,61 +112,57 @@ Thread thread; // declare stack size?
 Thread inputThread; // declare stack size?
 Thread motorCtrlT(osPriorityNormal,1024);
 
-// use mutex to prevent simultaneous access
-Mutex newKey_mutex;
-Mutex dutyCycle_mutex;
-
-// add volatile so that value can change between threads
-uint64_t newKey;
-char inputKey[18];
-string receivedDutyCycle;
-string dutyCycle;
-
-//Initialise the serial port
-RawSerial pc(SERIAL_TX, SERIAL_RX);
-
-// create a global instance of Queue<void, 8> to buffer incoming characters or strings
 Queue<void, 8> inCharQ;
-
 Mail<mail_t, 16> mail_box;
-Mail<motor_t, 16> mail_box_motor;
 
-//MBED timer class
-Timer t; 
+Timer t; //MBED timer class
 
-// PWMOut class
-PwmOut motor(D9);
+PwmOut motor(D9); // PWMOut class
+int pwm_period = 2000;
+
+Mutex input_mutex; // use mutex to prevent simultaneous access
 
 //Rotor offset at motor state 0
 int8_t orState = 0;    
 int8_t intState = 0;
 int8_t intStateOld = 0;
 int8_t stateChange = 0;
-int8_t velocity = 0;
+int64_t velocity = 0;           // revolutions / sec
 int iterCount = 0;
+int interruptCount;             // count number of interrupts
+float revCount = 0;             // count number of revolutions = interrupts / 6
 
-//Create an instance of the class SHA256 
-SHA256 sha256;
+uint64_t newKey;                // key
+char inputKey[18];
+int64_t SMax;                   // setting rotation speed
+int64_t T;                      // torque
+uint64_t T_pwm;                 // pwm torque
 
 //Set a given drive state
-void motorOut(int8_t driveState){
+void motorOut(int8_t driveState){//}, uint64_t torque){
     
     //Lookup the output byte from the drive state.
     int8_t driveOut = driveTable[driveState & 0x07];
       
     //Turn off first
+    //if (~driveOut & 0x01) L1L.pulsewidth_us(0);
     if (~driveOut & 0x01) L1L = 0;
     if (~driveOut & 0x02) L1H = 1;
-    if (~driveOut & 0x04) L2L = 0;
+    //if (~driveOut & 0x04) L2L.pulsewidth_us(0);
+    if (~driveOut & 0x01) L2L = 0;
     if (~driveOut & 0x08) L2H = 1;
-    if (~driveOut & 0x10) L3L = 0;
+    //if (~driveOut & 0x10) L3L.pulsewidth_us(0);
+    if (~driveOut & 0x01) L3L = 0;
     if (~driveOut & 0x20) L3H = 1;
     
     //Then turn on
+    //if (driveOut & 0x01) L1L.pulsewidth_us(torque);
     if (driveOut & 0x01) L1L = 1;
     if (driveOut & 0x02) L1H = 0;
+    //if (driveOut & 0x04) L2L.pulsewidth_us(torque);
     if (driveOut & 0x04) L2L = 1;
     if (driveOut & 0x08) L2H = 0;
+    //if (driveOut & 0x10) L3L.pulsewidth_us(torque);
     if (driveOut & 0x10) L3L = 1;
     if (driveOut & 0x20) L3H = 0;
     }
@@ -178,53 +184,26 @@ void motorOut(int8_t driveState){
 
 // new photointerrupt ISR
 void motorPosition() {
-    intStateOld = intState;
+    //intStateOld = intState;
     intState = readRotorState();
+    stateChange = intState - intStateOld;
     if (intState != intStateOld) {
-        stateChange = intState - intStateOld;
         if(intState > intStateOld){
             // state has increased -> positive direction
             movementDirection = "positive"; 
+            interruptCount++;
             lead = 2;
         }
         else{
             // state has decreased -> negative(?) direction
             movementDirection = "negative";
+            interruptCount--;
             lead = -2;
         }
-        intStateOld = intState;
-        motorOut((intState-orState+lead+6)%6); //+6 to make sure the remainder is positive
+        motorOut((intState-orState+lead+6)%6);//, pwm_period); //+6 to make sure the remainder is positive
          //pc.printf("%d\n\r",intState);
     }
-}
-
-void motorCtrlTick(){ 
-    iterCount++; 
-    motorCtrlT.signal_set(0x1);
-}
-
-void motorCtrlFn(){
-    // run every 100ms
-    Ticker motorCtrlTicker; 
-    motorCtrlTicker.attach_us(&motorCtrlTick,100000); 
-    while(1){
-        motorCtrlT.signal_wait(0x1);
-        // temporarily disable interrupts
-        core_util_critical_section_enter();
-        if(iterCount == 10){
-            if(motor.read() == 0.0){
-                velocity = 0;
-            }
-            else{
-                velocity = stateChange * 10;
-            }
-            pc.printf("Position: %d\n\r", intState);
-            pc.printf("Velocity: %d\n\r", velocity);
-            motorPosition();
-            iterCount = 0;
-        }
-        core_util_critical_section_exit();
-    }
+    intStateOld = intState;
 }
 
 // create an ISR to receive each incoming byte and place it into a queue
@@ -234,32 +213,69 @@ void serialISR(){
     inCharQ.put((void*)newChar);
 }
 
-void send_thread(uint64_t* data) {
+void send_thread(uint8_t code, uint64_t data) {
     mail_t *mail = mail_box.alloc();
+    mail->code = code;
     mail->data = data;
     mail_box.put(mail);
     wait(1);
 }
 
-void send_motor_control(string* data) {
-    motor_t *mail = mail_box_motor.alloc();
-    mail->data = data;
-    mail_box_motor.put(mail);
-    wait(1);
-}
-
 void print_thread(void) {
     while(true){
+
+        int64_t Kps = 25;   // maximum to avoid oscillation
+        int64_t currentS;     // absolute value of current speed
+        int64_t e;            // change in speed    
+
         osEvent evt = mail_box.get();
+
         if (evt.status == osEventMail) {
             
             mail_t *mail = (mail_t*)evt.value.p;
 
-            pc.printf("\n\r");
-            pc.printf("nonce: ");
-            uint64_t* receivedNonce = mail->data;
-            for(int i = 0; i < 8; ++i){
-                pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
+            switch(mail->code){
+                case ERROR:
+                    break;
+                case KEY:
+                    //???
+                    break;
+                case NONCE: // KEY
+                    pc.printf("\n\r");
+                    pc.printf("nonce: ");
+                    uint64_t receivedNonce = mail->data;
+                    for(int i = 0; i < 8; ++i){
+                        pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
+                    }
+                    break;
+                case VELOCITY: // proportional motor speed control
+
+                    mail_t *mail = (mail_t*)evt.value.p;
+                    int64_t receivedS = mail->data;
+                    pc.printf("receivedS: %d\n\r", receivedS);
+                    pc.printf("velocity: %d\n\r", velocity);
+                    currentS = abs(velocity);
+                    pc.printf("currentS: %d\n\r", currentS);
+                    e = receivedS - currentS;
+                    pc.printf("received - current: %d\n\r", e);
+                    T = Kps * e;
+
+                    if(T < 0){
+                        T_pwm = -T; // negative values need to be made positive
+                        lead = -2; // backwards rotation
+                    } 
+                    else{
+                        T_pwm = T;
+                        lead = 2; // forwards rotation
+                    }
+
+                    pc.printf("T_pwm: %d\n\r", T_pwm);
+                    pwm_period = T_pwm;
+                    //motorOut((intState-orState+lead+6)%6, T_pwm);
+                    motor.pulsewidth_us(T_pwm);
+                    pc.printf("velocity: %d\n\r", velocity);
+                    pc.printf("\n\r");
+                    break;
             }
             
         mail_box.free(mail);
@@ -269,18 +285,18 @@ void print_thread(void) {
 
 void decode_instruction(char* input){
     if(input[0] == 'K'){
-        newKey_mutex.lock();
+        input_mutex.lock();
         sscanf(input,"K%10llx", &newKey);
-        newKey_mutex.unlock();
-        send_thread(&newKey);
+        input_mutex.unlock();
+        send_thread(KEY, newKey);
     }
-    else if(input[0] == 'M'){
-            dutyCycle_mutex.lock();
-            sscanf(input,"M%s", dutyCycle.c_str());
-            pc.printf("M%s", input);
-            dutyCycle_mutex.unlock();
-            send_motor_control(&dutyCycle);
-        }
+    else if(input[0] == 'V'){
+        input_mutex.lock();
+        // expected input of format V\d{1,3}(\.\d{1,3})?
+        sscanf(input,"V%d", &SMax);
+        input_mutex.lock();
+        send_thread(VELOCITY, SMax);
+    }
 }
 
 void decode_thread(void){
@@ -302,14 +318,34 @@ void decode_thread(void){
     }
 }
 
-void motorControl() {
-    dutyCycle_mutex.lock();
-    receivedDutyCycle = dutyCycle;
-    dutyCycle_mutex.unlock();
+void motorCtrlTick(){ 
+    iterCount++; 
+    motorCtrlT.signal_set(0x1);
+}
 
-    string s = receivedDutyCycle;
-    float newDutyCycle = atof(s.c_str());
-    motor.write(newDutyCycle);
+void motorCtrlFn(){
+    interruptCount = 0;
+    t.start();
+    // run every 100ms
+    Ticker motorCtrlTicker; 
+    motorCtrlTicker.attach_us(&motorCtrlTick,100000);  
+    uint32_t iterTime = 0;
+
+    while(true){
+        motorCtrlT.signal_wait(0x1);
+        core_util_critical_section_enter(); // temporarily disable interrupts
+
+        if(iterCount == 10){
+            revCount = interruptCount / 6;
+            velocity = revCount * 10;
+            pc.printf("v: %d\n\r", velocity);
+            interruptCount = 0;
+            motorPosition();
+            iterCount = 0;
+            }
+        
+        core_util_critical_section_exit();
+    }
 }
 
 void computationRate(float startTime, float elapsedTime, int counter){
@@ -348,17 +384,20 @@ int main() {
     inputThread.start(callback(decode_thread));
     motorCtrlT.start(callback(motorCtrlFn));
     
-    motor.period(0.002f);     // 2ms period
-    motor.write(0.50f);       // 50% duty cycle, relative to period
+    // 2ms period
+    motor.period_us(pwm_period);     
+    //L1L.period_us(pwm_period);
+    //L2L.period_us(pwm_period);
+    //L3L.period_us(pwm_period);
+    //motor.write(0.50f);       // 50% duty cycle, relative to period
+    motor.write(100.0);       // 100% duty cycle, relative to period
     
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
         
-        motorControl();
-        
-        newKey_mutex.lock(); 
+        input_mutex.lock(); 
         *key = newKey; 
-        newKey_mutex.unlock();
+        input_mutex.unlock();
         //sequence now contains the new key
         sha256.computeHash(hash, sequence, 64);
         counter++;
@@ -367,7 +406,7 @@ int main() {
         t.start();
         float startTime = t.read();
         if(hash[0] == 0 &&  hash[1] == 0) {
-            send_thread(nonce);
+            //send_thread(NONCE, nonce);
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
