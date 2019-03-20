@@ -67,23 +67,22 @@ const int8_t stateMap[] = {0x07,0x05,0x03,0x04,0x01,0x00,0x02,0x07};
 //const int8_t stateMap[] = {0x07,0x01,0x03,0x02,0x05,0x00,0x04,0x07}; //Alternative if phase order of input or drive is reversed
 
 //Phase lead to make motor spin
-//const int8_t lead = 2;  //2 for forwards, -2 for backwards
+//2 for forwards, -2 for backwards
 int8_t lead = 2;
-// string output for user friendly representation -> can remove
-string movementDirection;
 
 // code options for input to mail_t structure
 enum dataCode {
     ERROR1 = 0,
     NONCE = 1,
     KEY = 2,
-    VELOCITY = 3
+    VELOCITY = 3,
+    ROTATIONS = 4
 };
 
 //Mailbox structure
 typedef struct {
     uint8_t code;
-    uint64_t data;    
+    int64_t data;    
 } mail_t;
 
 //Initialise the serial port
@@ -99,12 +98,12 @@ InterruptIn I1(I1pin);
 InterruptIn I2(I2pin);
 InterruptIn I3(I3pin);
 
-//Motor Drive outputs
-DigitalOut L1L(L1Lpin);
+//Motor Drive outputs - Declare low pins as Pwm to take torque input
+PwmOut L1L(L1Lpin);
 DigitalOut L1H(L1Hpin);
-DigitalOut L2L(L2Lpin);
+PwmOut L2L(L2Lpin);
 DigitalOut L2H(L2Hpin);
-DigitalOut L3L(L3Lpin);
+PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
 //Thread initialisations
@@ -117,8 +116,8 @@ Mail<mail_t, 16> mail_box;
 
 Timer t; //MBED timer class
 
-PwmOut motor(D9); // PWMOut class
-int pwm_period = 2000;
+//PwmOut motor(PWMpin); // PWMOut class
+int64_t pwm_period = 2000; // PWM period is us
 
 Mutex input_mutex; // use mutex to prevent simultaneous access
 
@@ -127,55 +126,54 @@ int8_t orState = 0;
 int8_t intState = 0;
 int8_t intStateOld = 0;
 int8_t stateChange = 0;
-int64_t velocity = 0;           // revolutions / sec
+volatile int64_t velocity = 0;           // revolutions / sec
 int iterCount = 0;
-int interruptCount;             // count number of interrupts
+int interruptCount = 0;             // count number of interrupts
 float revCount = 0;             // count number of revolutions = interrupts / 6
+volatile int64_t target_speed = 0;             // target speed
+volatile int64_t target_position = 0;
 
-uint64_t newKey;                // key
-char inputKey[18];
-int64_t SMax;                   // setting rotation speed
-int64_t T;                      // torque
-uint64_t T_pwm;                 // pwm torque
+uint64_t newKey;                    // key
+char inputKey[18];                   // setting rotation speed
+int64_t T = 0;                      // speed torque
+int64_t torque_speed = 0;                 // speed torque (abs)
+int64_t Tp = 0;                     // position torque
+int64_t torque_position = 0;        // position torque (abs)
+int old_rotation_count;
+float er_prev;    // previous rotation error
 
 //Set a given drive state
-void motorOut(int8_t driveState){//}, uint64_t torque){
+void motorOut(int8_t driveState, uint64_t torque){
     
     //Lookup the output byte from the drive state.
     int8_t driveOut = driveTable[driveState & 0x07];
       
     //Turn off first
-    //if (~driveOut & 0x01) L1L.pulsewidth_us(0);
-    if (~driveOut & 0x01) L1L = 0;
+    if (~driveOut & 0x01) L1L.pulsewidth_us(0);
     if (~driveOut & 0x02) L1H = 1;
-    //if (~driveOut & 0x04) L2L.pulsewidth_us(0);
-    if (~driveOut & 0x01) L2L = 0;
+    if (~driveOut & 0x04) L2L.pulsewidth_us(0);
     if (~driveOut & 0x08) L2H = 1;
-    //if (~driveOut & 0x10) L3L.pulsewidth_us(0);
-    if (~driveOut & 0x01) L3L = 0;
+    if (~driveOut & 0x10) L3L.pulsewidth_us(0);
     if (~driveOut & 0x20) L3H = 1;
     
     //Then turn on
-    //if (driveOut & 0x01) L1L.pulsewidth_us(torque);
-    if (driveOut & 0x01) L1L = 1;
+    if (driveOut & 0x01) L1L.pulsewidth_us(torque);
     if (driveOut & 0x02) L1H = 0;
-    //if (driveOut & 0x04) L2L.pulsewidth_us(torque);
-    if (driveOut & 0x04) L2L = 1;
+    if (driveOut & 0x04) L2L.pulsewidth_us(torque);
     if (driveOut & 0x08) L2H = 0;
-    //if (driveOut & 0x10) L3L.pulsewidth_us(torque);
-    if (driveOut & 0x10) L3L = 1;
+    if (driveOut & 0x10) L3L.pulsewidth_us(torque);
     if (driveOut & 0x20) L3H = 0;
-    }
+}
     
     //Convert photointerrupter inputs to a rotor state
-    inline int8_t readRotorState(){
-        return stateMap[I1 + 2*I2 + 4*I3];
-    }
+inline int8_t readRotorState(){
+    return stateMap[I1 + 2*I2 + 4*I3];
+}
 
-    //Basic synchronisation routine    
-    int8_t motorHome() {
+//Basic synchronisation routine    
+int8_t motorHome() {
     //Put the motor in drive state 0 and wait for it to stabilise
-    motorOut(0);
+    motorOut(0,pwm_period);
     wait(2.0);
     
     //Get the rotor state
@@ -188,22 +186,13 @@ void motorPosition() {
     intState = readRotorState();
     stateChange = intState - intStateOld;
     if (intState != intStateOld) {
-        if(intState > intStateOld){
-            // state has increased -> positive direction
-            movementDirection = "positive"; 
-            interruptCount++;
-            lead = 2;
-        }
-        else{
-            // state has decreased -> negative(?) direction
-            movementDirection = "negative";
-            interruptCount--;
-            lead = -2;
-        }
-        motorOut((intState-orState+lead+6)%6);//, pwm_period); //+6 to make sure the remainder is positive
-         //pc.printf("%d\n\r",intState);
+        motorOut((intState-orState+lead+6)%6,torque_position); //+6 to make sure the remainder is positive
+        if(intState - intStateOld == 5) interruptCount++;
+        else if (intState - intStateOld == -5) interruptCount--;
+        else interruptCount += (intState - intStateOld);
+        intStateOld = intState;
     }
-    intStateOld = intState;
+    
 }
 
 // create an ISR to receive each incoming byte and place it into a queue
@@ -222,11 +211,7 @@ void send_thread(uint8_t code, uint64_t data) {
 }
 
 void print_thread(void) {
-    while(true){
-
-        int64_t Kps = 25;   // maximum to avoid oscillation
-        int64_t currentS;     // absolute value of current speed
-        int64_t e;            // change in speed    
+    while(true){  
 
         osEvent evt = mail_box.get();
 
@@ -249,33 +234,12 @@ void print_thread(void) {
                     }
                     break;
                 case VELOCITY: // proportional motor speed control
-
-                    mail_t *mail = (mail_t*)evt.value.p;
-                    int64_t receivedS = mail->data;
-                    pc.printf("receivedS: %d\n\r", receivedS);
-                    pc.printf("velocity: %d\n\r", velocity);
-                    currentS = abs(velocity);
-                    pc.printf("currentS: %d\n\r", currentS);
-                    e = receivedS - currentS;
-                    pc.printf("received - current: %d\n\r", e);
-                    T = Kps * e;
-
-                    if(T < 0){
-                        T_pwm = -T; // negative values need to be made positive
-                        lead = -2; // backwards rotation
-                    } 
-                    else{
-                        T_pwm = T;
-                        lead = 2; // forwards rotation
-                    }
-
-                    pc.printf("T_pwm: %d\n\r", T_pwm);
-                    pwm_period = T_pwm;
-                    //motorOut((intState-orState+lead+6)%6, T_pwm);
-                    motor.pulsewidth_us(T_pwm);
-                    pc.printf("velocity: %d\n\r", velocity);
-                    pc.printf("\n\r");
+                    pc.printf("Vel thread accessed\n\r");
+                    pc.printf("target vel = %d\n\r", target_speed);
                     break;
+                case ROTATIONS: // PD position control
+                    pc.printf("Position thread accessed\n\r");
+                    pc.printf("target pos = %d\n\r", target_position);
             }
             
         mail_box.free(mail);
@@ -293,14 +257,21 @@ void decode_instruction(char* input){
     else if(input[0] == 'V'){
         input_mutex.lock();
         // expected input of format V\d{1,3}(\.\d{1,3})?
-        sscanf(input,"V%d", &SMax);
+        sscanf(input,"V%d", &target_speed);
         input_mutex.lock();
-        send_thread(VELOCITY, SMax);
+        send_thread(VELOCITY, target_speed);
+    }
+    else if(input[0] == 'R'){
+        input_mutex.lock();
+        // expected input of format V\d{1,3}(\.\d{1,3})?
+        sscanf(input,"R%d", &target_position);
+        input_mutex.lock();
+        send_thread(ROTATIONS, target_position);
     }
 }
 
 void decode_thread(void){
-    pc.printf("Enter the key:\n\r");
+    pc.printf("Enter the command:\n\r");
     pc.attach(&serialISR);
     uint8_t ptr = 0;
     while(1){
@@ -324,27 +295,98 @@ void motorCtrlTick(){
 }
 
 void motorCtrlFn(){
-    interruptCount = 0;
-    t.start();
+    //interruptCount = 0;  // move but check first
     // run every 100ms
     Ticker motorCtrlTicker; 
     motorCtrlTicker.attach_us(&motorCtrlTick,100000);  
     uint32_t iterTime = 0;
 
+
+    int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
+    int64_t Kpr = 25;   // proportional constant for rotation controller
+    int64_t Kdr = 25;   // derivative constant for rotation controller
+    int rotation_count = 0;
+    float current_position;
+    int64_t currentS = 0;     // absolute value of current speed
+    int64_t es = 0;            // speed error  
+    float er;         // rotation error
+    float er_derivative = 0;
+    // previous rotation error
+
     while(true){
         motorCtrlT.signal_wait(0x1);
         core_util_critical_section_enter(); // temporarily disable interrupts
+        
+        rotation_count = interruptCount;
+        current_position = rotation_count / 6;
+        velocity = (rotation_count - old_rotation_count) * 10; // determine state changes per second
+        old_rotation_count = rotation_count;
+
+        currentS = abs(velocity); // absolute value of speed
+        es = target_speed - currentS; // speed error
+
+        T = Kps * es; // torque
+
+        if(T < 0){
+            pc.printf("hi\n\r");
+            torque_speed = -T; // negative values need to be made positive
+            lead = -2; // backwards rotation
+        } 
+        else{
+            torque_speed = T;
+            lead = 2; // forwards rotation
+        }
+    
+        if(torque_speed > (pwm_period)) torque_speed = pwm_period;
 
         if(iterCount == 10){
-            revCount = interruptCount / 6;
-            velocity = revCount * 10;
+            //revCount = interruptCount / 6;
             pc.printf("v: %d\n\r", velocity);
-            interruptCount = 0;
-            motorPosition();
+            pc.printf("T: %d\n\r", torque_speed);
+            pc.printf("TARGET v: %d\n\r", target_speed);
+           // interruptCount = 0;
+
             iterCount = 0;
-            }
+        }
+
+        motorOut((intState-orState+lead+6)%6, torque_speed); // write to motor output with new torque
+
+
+        er = target_position - current_position; // position error
+        er_derivative = er - er_prev; // time derivative of position error
+        er_prev = er;
+        Tp = Kpr * er + Kdr * er_derivative; // position torque
+
+        if(Tp < 0){
+            pc.printf("hi\n\r");
+            torque_position = -Tp; // negative values need to be made positive
+            lead = -2; // backwards rotation
+        } 
+        else{
+            torque_position = Tp;
+            lead = 2; // forwards rotation
+        }
+
+        if(torque_position > pwm_period) torque_position = pwm_period;
+
+        if(iterCount == 10){
+            //revCount = interruptCount / 6;
+            pc.printf("p: %d\n\r", current_position);
+            pc.printf("T: %d\n\r", torque_position);
+            pc.printf("TARGET p: %d\n\r", target_position);
+            pc.printf("Remaining: %f\n\r", er);
+           // interruptCount = 0;
+
+            iterCount = 0;
+        }
+
+        if(current_position == target_position) current_position = 0;
+
+        motorOut((intState-orState+lead+6)%6, torque_position);
+
         
         core_util_critical_section_exit();
+        motorPosition();
     }
 }
 
@@ -366,6 +408,17 @@ int main() {
     
     pc.printf("\n");
     pc.printf("Hello\n\r");
+
+    // 2ms period
+   // motor.period_us(pwm_period);     
+    L1L.period_us(pwm_period);
+    L2L.period_us(pwm_period);
+    L3L.period_us(pwm_period);
+    L1L.write(100.0);
+    L2L.write(100.0);
+    L3L.write(100.0);
+    //motor.write(0.50f);       // 50% duty cycle, relative to period
+   // motor.write(100.0);       // 100% duty cycle, relative to period
     
     //Run the motor synchronisation
     orState = motorHome();
@@ -384,13 +437,6 @@ int main() {
     inputThread.start(callback(decode_thread));
     motorCtrlT.start(callback(motorCtrlFn));
     
-    // 2ms period
-    motor.period_us(pwm_period);     
-    //L1L.period_us(pwm_period);
-    //L2L.period_us(pwm_period);
-    //L3L.period_us(pwm_period);
-    //motor.write(0.50f);       // 50% duty cycle, relative to period
-    motor.write(100.0);       // 100% duty cycle, relative to period
     
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
@@ -417,3 +463,4 @@ int main() {
         computationRate(startTime, elapsedTime, counter);   
     }
 }
+
