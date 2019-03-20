@@ -457,6 +457,7 @@ int main() {
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
         (*nonce)++;
+        //
 
         //Every second, report the current computation rate
         float elapsedTime = t.read() - startTime;
