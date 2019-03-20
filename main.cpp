@@ -132,15 +132,19 @@ int interruptCount = 0;             // count number of interrupts
 float revCount = 0;             // count number of revolutions = interrupts / 6
 volatile int64_t target_speed = 0;             // target speed
 volatile int64_t target_position = 0;
+volatile int64_t s_max = 0;         // max speed in rev/s
 
 uint64_t newKey;                    // key
 char inputKey[18];                   // setting rotation speed
-int64_t T = 0;                      // speed torque
-int64_t torque_speed = 0;                 // speed torque (abs)
-int64_t Tp = 0;                     // position torque
-int64_t torque_position = 0;        // position torque (abs)
-int old_rotation_count;
+int64_t T = 2000;                      // speed torque
+int64_t torque_speed = 2000;                 // speed torque (abs)
+int64_t Tp = 20000;                     // position torque
+int64_t torque_position = 2000;        // position torque (abs)
+int old_state_change_count;
 float er_prev;    // previous rotation error
+
+// function prototypes
+int sgn(float x);
 
 //Set a given drive state
 void motorOut(int8_t driveState, uint64_t torque){
@@ -186,7 +190,7 @@ void motorPosition() {
     intState = readRotorState();
     stateChange = intState - intStateOld;
     if (intState != intStateOld) {
-        motorOut((intState-orState+lead+6)%6,torque_position); //+6 to make sure the remainder is positive
+        motorOut((intState-orState+lead+6)%6,torque_speed); //+6 to make sure the remainder is positive
         if(intState - intStateOld == 5) interruptCount++;
         else if (intState - intStateOld == -5) interruptCount--;
         else interruptCount += (intState - intStateOld);
@@ -235,7 +239,7 @@ void print_thread(void) {
                     break;
                 case VELOCITY: // proportional motor speed control
                     pc.printf("Vel thread accessed\n\r");
-                    pc.printf("target vel = %d\n\r", target_speed);
+                    pc.printf("target vel = %d\n\r", s_max);
                     break;
                 case ROTATIONS: // PD position control
                     pc.printf("Position thread accessed\n\r");
@@ -257,15 +261,15 @@ void decode_instruction(char* input){
     else if(input[0] == 'V'){
         input_mutex.lock();
         // expected input of format V\d{1,3}(\.\d{1,3})?
-        sscanf(input,"V%d", &target_speed);
-        input_mutex.lock();
-        send_thread(VELOCITY, target_speed);
+        sscanf(input,"V%d", &s_max);
+        input_mutex.unlock();
+        send_thread(VELOCITY, s_max);
     }
     else if(input[0] == 'R'){
         input_mutex.lock();
         // expected input of format V\d{1,3}(\.\d{1,3})?
         sscanf(input,"R%d", &target_position);
-        input_mutex.lock();
+        input_mutex.unlock();
         send_thread(ROTATIONS, target_position);
     }
 }
@@ -305,7 +309,7 @@ void motorCtrlFn(){
     int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
     int64_t Kpr = 25;   // proportional constant for rotation controller
     int64_t Kdr = 25;   // derivative constant for rotation controller
-    int rotation_count = 0;
+    int state_change_count = 0;
     float current_position;
     int64_t currentS = 0;     // absolute value of current speed
     int64_t es = 0;            // speed error  
@@ -317,15 +321,22 @@ void motorCtrlFn(){
         motorCtrlT.signal_wait(0x1);
         core_util_critical_section_enter(); // temporarily disable interrupts
         
-        rotation_count = interruptCount;
-        current_position = rotation_count / 6;
-        velocity = (rotation_count - old_rotation_count) * 10; // determine state changes per second
-        old_rotation_count = rotation_count;
+        state_change_count = interruptCount;
+        current_position = state_change_count / 6;
+        velocity = (state_change_count - old_state_change_count) * 10; // determine interrupts (number of state changes) per second
+        old_state_change_count = state_change_count;
+
+        er = target_position - current_position; // position error
+        er_derivative = er - er_prev; // time derivative of position error
+        er_prev = er;
+        Tp = Kpr * er + Kdr * er_derivative; // position torque
 
         currentS = abs(velocity); // absolute value of speed
         es = target_speed - currentS; // speed error
 
-        T = Kps * es; // torque
+        if(target_speed == 0) T = pwm_period; // set max torque for V0
+        else if(target_position == 0) T = (Kps * es); // torque
+        else T = (Kps * es) * sgn(er);
 
         if(T < 0){
             pc.printf("hi\n\r");
@@ -341,21 +352,19 @@ void motorCtrlFn(){
 
         if(iterCount == 10){
             //revCount = interruptCount / 6;
-            pc.printf("v: %d\n\r", velocity);
+            pc.printf("v: %d\n\r", velocity / 6);
             pc.printf("T: %d\n\r", torque_speed);
-            pc.printf("TARGET v: %d\n\r", target_speed);
+            pc.printf("TARGET v: %d\n\r", target_speed / 6);
            // interruptCount = 0;
 
             iterCount = 0;
         }
 
+
         motorOut((intState-orState+lead+6)%6, torque_speed); // write to motor output with new torque
 
 
-        er = target_position - current_position; // position error
-        er_derivative = er - er_prev; // time derivative of position error
-        er_prev = er;
-        Tp = Kpr * er + Kdr * er_derivative; // position torque
+        /*
 
         if(Tp < 0){
             pc.printf("hi\n\r");
@@ -374,7 +383,7 @@ void motorCtrlFn(){
             pc.printf("p: %d\n\r", current_position);
             pc.printf("T: %d\n\r", torque_position);
             pc.printf("TARGET p: %d\n\r", target_position);
-            pc.printf("Remaining: %f\n\r", er);
+            pc.printf("Remaining: %d\n\r", er);
            // interruptCount = 0;
 
             iterCount = 0;
@@ -382,7 +391,7 @@ void motorCtrlFn(){
 
         if(current_position == target_position) current_position = 0;
 
-        motorOut((intState-orState+lead+6)%6, torque_position);
+        motorOut((intState-orState+lead+6)%6, torque_position); */
 
         
         core_util_critical_section_exit();
@@ -403,6 +412,13 @@ void computationRate(float startTime, float elapsedTime, int counter){
         counter = 0;
         } 
 }
+
+int sgn(float x)
+{
+    if(x < 0) return -1;
+    else return 1;
+}
+
 //Main
 int main() {
     
@@ -457,7 +473,6 @@ int main() {
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
         (*nonce)++;
-        //
 
         //Every second, report the current computation rate
         float elapsedTime = t.read() - startTime;
