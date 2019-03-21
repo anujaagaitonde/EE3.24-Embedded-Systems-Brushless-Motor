@@ -45,7 +45,7 @@ uint8_t sequence[] = {0x45,0x6D,0x62,0x65,0x64,0x64,0x65,0x64,
 uint64_t* key = (uint64_t*)((int)sequence + 48); 
 uint64_t* nonce = (uint64_t*)((int)sequence + 56); 
 uint8_t hash[32];
-int counter = 0;
+int computation_counter = 0;
 
 //Mapping from sequential drive states to motor phase outputs
 /*
@@ -80,7 +80,7 @@ enum dataCode {
     VELOCITY = 5,
     TORQUE = 6,
     POSITION = 7,
-    REMAINING = 8
+    HASHRATE = 8
 };
 
 //Mailbox structure
@@ -136,12 +136,13 @@ volatile float s_max = 0;              // user defined maximum velocity in revol
 volatile float current_velocity;           // current velocity in interrupts / sec
 volatile float current_position;        // current position in states
 volatile float p_max = 0;    // user defined number of rotations
+volatile float current_er;
 
 int iterCount = 0;
 float interruptCount = 0;             // count number of interrupts
 float revCount = 0;             // count number of revolutions = interrupts / 6       // max speed in rev/s
 
-uint64_t newKey;                    // key
+volatile uint64_t newKey;                    // key
 char inputKey[18];                   // setting rotation speed
 int64_t torque_speed = 1000;                      // speed torque
 int64_t output_torque = 1000;                 // output torque             
@@ -164,7 +165,7 @@ void decode_instruction(char* input);
 void decode_thread(void);
 void motorCtrlTick();
 void motorCtrlFn();
-void computationRate(float startTime, float elapsedTime, int counter);
+void computationRate(float elapsedTime, int computation_counter);
 
 
 
@@ -247,35 +248,37 @@ void print_thread(void) {
 
             switch(mail->code){
                 case ERRORCODE:
+                    pc.printf("Error. Try again\n\r");
                     break;
                 case KEY:
-                    pc.printf("Key thread accessed\n\r");
-                    pc.printf("decoded key = K%016llx\n\r", newKey);
+                    pc.printf("Decoded key = 0x%016x\n\r", mail -> data);
                     break;
                 case NONCE:
-                    pc.printf("\n\r");
-                    pc.printf("nonce: ");
-                    uint64_t receivedNonce = mail->data;
-                    for(int i = 0; i < 8; ++i){
-                        pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
-                    }
-                    pc.printf("\n\r");
+                    pc.printf("Found a nonce = 0x%016x\n\r", mail -> data);
+                    // uint64_t receivedNonce = mail->data;
+                    // for(int i = 0; i < 8; ++i){
+                    //     pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
+                    // }
+                    // pc.printf("\n\r");
                     break;
                 case TARGETVELOCITY: // proportional motor speed control
-                    pc.printf("target vel =\t%.3f\n\r", s_max);
+                    pc.printf("Target Velocity = %.3f\n\r", s_max);
                     break;
                 case ROTATIONS: // PD position control
-                    pc.printf("target pos =\t%.3f\n\r", p_max);
+                    pc.printf("Target Rotations = %.3f\n\r", p_max);
                     break;
                 case VELOCITY:
-                    pc.printf("vel: %.3f\n\r", mail->data);
+                    pc.printf("Current Velocity = %.3f\n\r", (current_velocity/6));
                     break;
                 case TORQUE:
-                    pc.printf("torque: %d\n\r", mail->data);
+                    pc.printf("Current Torque = %d\n\r", output_torque);
+                    break;
                 case POSITION:
-                    pc.printf("position: %.3f\n\r", mail->data);
-                case REMAINING:
-                    pc.printf("remaining: %.3f\n\r", mail->data);
+                    pc.printf("Current Rotations = %.3f\n\r", current_position);
+                    break;
+                case HASHRATE:
+                    pc.printf("Computation Rate = %d\n\r", mail -> data);
+                    break;
             }
             
         mail_box.free(mail);
@@ -286,7 +289,7 @@ void print_thread(void) {
 void decode_instruction(char* input){
     if(input[0] == 'K'){
         input_mutex.lock();
-        sscanf(input,"K%18llx", &newKey);
+        sscanf(input,"K%10llx", &newKey);
         input_mutex.unlock();
         send_thread(KEY, newKey);
     }
@@ -340,15 +343,12 @@ void motorCtrlFn(){
 
     int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
     int64_t Kpr = 25;   // proportional constant for rotation controller
-    int64_t Kdr = 35;   // derivative constant for rotation controller
-
+    int64_t Kdr = 50;   // derivative constant for rotation controller
     float state_change_count = 0;
     float currentS = 0;     // absolute value of current speed
-
     float es = 0;            // speed error  
-    float er = 0;            // rotation error
+    float er = 0;         // rotation error
     float er_derivative = 0;
-
     static float old_state_change_count = 0;
     static float er_prev;
     // previous rotation error
@@ -359,10 +359,8 @@ void motorCtrlFn(){
         
         // calculate velocity and position change
         state_change_count = interruptCount;
-
         float position = state_change_count / 6; // determine current rotation position
         float velocity = (state_change_count - old_state_change_count) * 10; // determine number of interrupts (number of state changes) per second
-        
         old_state_change_count = state_change_count;
         current_velocity = velocity; // write current velocity to global copy
 
@@ -377,8 +375,10 @@ void motorCtrlFn(){
         es = target_speed - currentS; // speed error
 
         current_position = position;
+        current_er = er;
 
-        // P velocity torque controller: Ts = (Kps * es) * sgn (er_derivative) CHECK only if not V0 (max speed) or R0 (endless rotation)
+        // P velocity torque controller: Ts = (Kps * es) * sgn (er_derivative)
+        // PD position torque controller: Ts = Kpr * er + Kdr * er_derivative
         if (target_position == 0) // R0
         {
             if (target_speed == 0) // V0
@@ -405,7 +405,7 @@ void motorCtrlFn(){
 
             if(er < 0) torque_speed = -torque_speed; // only change when moving backwards
             
-            if((velocity < 0) && (torque_speed > torque_position))
+            if((velocity < 0))
             {
                 output_torque = max(torque_speed, torque_position);
             }
@@ -425,61 +425,41 @@ void motorCtrlFn(){
         }
     
         if(output_torque > (pwm_period)) output_torque = pwm_period;
-        
-        if(iterCount == 10){
-            
-            pc.printf("vel: %.3f\n\r", velocity/6);
-            //send_thread(VELOCITY, velocity/6);
-
-            pc.printf("torque: %d\n\r", output_torque);
-            //send_thread(TORQUE, output_torque); 
-
-            //pc.printf("TARGET v: %.3f\n\r", target_speed / 6);
-            //pc.printf("p: %.3f\n\r", position);
-
-            pc.printf("position: %.3f\n\r", target_position);
-            //send_thread(POSITION, target_position);
-
-            pc.printf("remaining: %.3f\n\r", er);
-            //send_thread(REMAINING, er);
-            
-            iterCount = 0;
-        }
 
         motorOut((intState-orState+lead+6)%6, output_torque); // write to motor output with new torque // MOVE LATER
        
-        core_util_critical_section_exit();
+        core_util_critical_section_exit(); // re-enable interrupts
+        if(iterCount == 10){ // display current velocity and position data every 1s
+            send_thread(VELOCITY, (velocity/6));
+            send_thread(POSITION, position);
+            iterCount = 0;
+        }
         motorPosition();
     }
 }
 
-void computationRate(float startTime, float elapsedTime, int counter){
+void computationRate(float elapsedTime, int computation_counter){ // calculate hash computation rate
     
     if(elapsedTime >= 1){
-        int computationRate = counter / elapsedTime;
-        pc.printf("\n\r");
-        pc.printf("Computation Rate = ");
-        pc.printf("%d", computationRate);
-        pc.printf(" Hashes per sec\n\r");
+        send_thread(HASHRATE, computation_count)
         t.reset();
-        startTime = t.read();
-        counter = 0;
-        } 
+        computation_counter = 0;
+    } 
 }
 
-int sgn(float x)
+int sgn(float x) // return sign
 {
     if(x < 0) return -1;
     else return 1;
 }
 
-float min(float x, float y)
+float min(float x, float y) // return minimum value
 {
     if(x < y) return x;
     else return y;
 }
 
-float max(float x, float y)
+float max(float x, float y) // return maximum value
 {
     if(x > y) return x;
     else return y;
@@ -488,7 +468,7 @@ float max(float x, float y)
 int main() {
     
     pc.printf("\n");
-    pc.printf("Hi Ed!\n\r");
+    pc.printf("Hello\n\r");
 
     // 2ms period
    // motor.period_us(pwm_period);     
@@ -518,21 +498,20 @@ int main() {
     inputThread.start(callback(decode_thread));
     motorCtrlT.start(callback(motorCtrlFn));
     
-    
+    t.start();
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
         
-        input_mutex.lock();
-        *key = newKey; //sequence now contains the new key
+        input_mutex.lock(); 
+        *key = newKey; 
         input_mutex.unlock();
-
+        //sequence now contains the new key
         sha256.computeHash(hash, sequence, 64);
-        counter++;
+        computation_count++;
         
         //Test for both hash[0] and hash[1] equal to zero to indicate a successful ‘nonce’
-        t.start();
-        float startTime = t.read();
-        if(hash[0] == 0 &&  hash[1] == 0) {
+        if(hash[0] == 0 &&  hash[1] == 0) 
+        {
             send_thread(NONCE, *nonce);
         }
         
@@ -540,8 +519,7 @@ int main() {
         (*nonce)++;
 
         //Every second, report the current computation rate
-        float elapsedTime = t.read() - startTime;
-        computationRate(startTime, elapsedTime, counter);   
+        float elapsedTime = t.read();
+        computationRate(elapsedTime, computation_count);   
     }
 }
-
