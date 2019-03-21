@@ -72,11 +72,15 @@ int8_t lead = 2;
 
 // code options for input to mail_t structure
 enum dataCode {
-    ERROR1 = 0,
+    ERRORCODE = 0,
     NONCE = 1,
     KEY = 2,
-    VELOCITY = 3,
-    ROTATIONS = 4
+    TARGETVELOCITY = 3,
+    ROTATIONS = 4,
+    VELOCITY = 5,
+    TORQUE = 6,
+    POSITION = 7,
+    REMAINING = 8
 };
 
 //Mailbox structure
@@ -242,26 +246,36 @@ void print_thread(void) {
             mail_t *mail = (mail_t*)evt.value.p;
 
             switch(mail->code){
-                case ERROR:
+                case ERRORCODE:
                     break;
                 case KEY:
-                    //???
+                    pc.printf("Key thread accessed\n\r");
+                    pc.printf("decoded key = K%016llx\n\r", newKey);
                     break;
-                case NONCE: // KEY
+                case NONCE:
                     pc.printf("\n\r");
                     pc.printf("nonce: ");
                     uint64_t receivedNonce = mail->data;
                     for(int i = 0; i < 8; ++i){
                         pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
                     }
+                    pc.printf("\n\r");
                     break;
-                case VELOCITY: // proportional motor speed control
-                    pc.printf("Vel thread accessed\n\r");
+                case TARGETVELOCITY: // proportional motor speed control
                     pc.printf("target vel =\t%.3f\n\r", s_max);
                     break;
                 case ROTATIONS: // PD position control
-                    pc.printf("Position thread accessed\n\r");
                     pc.printf("target pos =\t%.3f\n\r", p_max);
+                    break;
+                case VELOCITY:
+                    pc.printf("vel: %.3f\n\r", mail->data);
+                    break;
+                case TORQUE:
+                    pc.printf("torque: %d\n\r", mail->data);
+                case POSITION:
+                    pc.printf("position: %.3f\n\r", mail->data);
+                case REMAINING:
+                    pc.printf("remaining: %.3f\n\r", mail->data);
             }
             
         mail_box.free(mail);
@@ -272,7 +286,7 @@ void print_thread(void) {
 void decode_instruction(char* input){
     if(input[0] == 'K'){
         input_mutex.lock();
-        sscanf(input,"K%10llx", &newKey);
+        sscanf(input,"K%18llx", &newKey);
         input_mutex.unlock();
         send_thread(KEY, newKey);
     }
@@ -327,11 +341,14 @@ void motorCtrlFn(){
     int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
     int64_t Kpr = 25;   // proportional constant for rotation controller
     int64_t Kdr = 35;   // derivative constant for rotation controller
+
     float state_change_count = 0;
     float currentS = 0;     // absolute value of current speed
+
     float es = 0;            // speed error  
-    float er = 0;         // rotation error
+    float er = 0;            // rotation error
     float er_derivative = 0;
+
     static float old_state_change_count = 0;
     static float er_prev;
     // previous rotation error
@@ -342,8 +359,10 @@ void motorCtrlFn(){
         
         // calculate velocity and position change
         state_change_count = interruptCount;
+
         float position = state_change_count / 6; // determine current rotation position
         float velocity = (state_change_count - old_state_change_count) * 10; // determine number of interrupts (number of state changes) per second
+        
         old_state_change_count = state_change_count;
         current_velocity = velocity; // write current velocity to global copy
 
@@ -388,7 +407,7 @@ void motorCtrlFn(){
             
             if((velocity < 0) && (torque_speed > torque_position))
             {
-                output_torque = torque_speed, torque_position);
+                output_torque = max(torque_speed, torque_position);
             }
             else
             {
@@ -406,15 +425,24 @@ void motorCtrlFn(){
         }
     
         if(output_torque > (pwm_period)) output_torque = pwm_period;
-
+        
         if(iterCount == 10){
-            pc.printf("v: %.3f\n\r", velocity / 6);
-            pc.printf("T: %d\n\r", output_torque);
-            pc.printf("TARGET v: %.3f\n\r", target_speed / 6);
-            pc.printf("p: %.3f\n\r", position);
-            pc.printf("TARGET p: %.3f\n\r", target_position);
-            pc.printf("Remaining: %.3f\n\r", er);
+            
+            pc.printf("vel: %.3f\n\r", velocity/6);
+            //send_thread(VELOCITY, velocity/6);
 
+            pc.printf("torque: %d\n\r", output_torque);
+            //send_thread(TORQUE, output_torque); 
+
+            //pc.printf("TARGET v: %.3f\n\r", target_speed / 6);
+            //pc.printf("p: %.3f\n\r", position);
+
+            pc.printf("position: %.3f\n\r", target_position);
+            //send_thread(POSITION, target_position);
+
+            pc.printf("remaining: %.3f\n\r", er);
+            //send_thread(REMAINING, er);
+            
             iterCount = 0;
         }
 
@@ -432,7 +460,7 @@ void computationRate(float startTime, float elapsedTime, int counter){
         pc.printf("\n\r");
         pc.printf("Computation Rate = ");
         pc.printf("%d", computationRate);
-        pc.printf(" Hashes per sec");
+        pc.printf(" Hashes per sec\n\r");
         t.reset();
         startTime = t.read();
         counter = 0;
@@ -460,7 +488,7 @@ float max(float x, float y)
 int main() {
     
     pc.printf("\n");
-    pc.printf("Hello\n\r");
+    pc.printf("Hi Ed!\n\r");
 
     // 2ms period
    // motor.period_us(pwm_period);     
@@ -494,10 +522,10 @@ int main() {
     //Poll the rotor state and set the motor outputs accordingly to spin the motor
     while (1) {
         
-        input_mutex.lock(); 
-        *key = newKey; 
+        input_mutex.lock();
+        *key = newKey; //sequence now contains the new key
         input_mutex.unlock();
-        //sequence now contains the new key
+
         sha256.computeHash(hash, sequence, 64);
         counter++;
         
@@ -505,7 +533,7 @@ int main() {
         t.start();
         float startTime = t.read();
         if(hash[0] == 0 &&  hash[1] == 0) {
-            //send_thread(NONCE, nonce);
+            send_thread(NONCE, *nonce);
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
