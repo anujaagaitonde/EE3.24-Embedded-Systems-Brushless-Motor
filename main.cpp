@@ -129,25 +129,40 @@ int8_t stateChange = 0;
 
 // parameters modified by threads
 volatile float s_max = 0;              // user defined maximum velocity in revolutions / sec
-volatile float current_velocity = 0;           // current velocity in interrupts / sec
-// volatile float target_speed = 0;       // maximum velocity in interrupts / sec
-volatile float target_position = 0;    // user defined number of rotations
+volatile float current_velocity;           // current velocity in interrupts / sec
+volatile float current_position;        // current position in states
+volatile float p_max = 0;    // user defined number of rotations
 
 int iterCount = 0;
-int interruptCount = 0;             // count number of interrupts
+float interruptCount = 0;             // count number of interrupts
 float revCount = 0;             // count number of revolutions = interrupts / 6       // max speed in rev/s
 
 uint64_t newKey;                    // key
 char inputKey[18];                   // setting rotation speed
-int64_t T = 2000;                      // speed torque
-int64_t torque_speed = 2000;                 // speed torque (abs)
-int64_t Tp = 20000;                     // position torque
-int64_t torque_position = 2000;        // position torque (abs)
-int old_state_change_count;
+int64_t torque_speed = 1000;                      // speed torque
+int64_t output_torque = 1000;                 // output torque             
+int64_t torque_position = 1000;        // position torque
+// int old_state_change_count;
 float er_prev;    // previous rotation error
 
 // function prototypes
 int sgn(float x);
+float min(float x, float y);
+float max(float x, float y);
+void motorOut(int8_t driveState, uint64_t torque);
+inline int8_t readRotorState();
+int8_t motorHome();
+void motorPosition();
+void serialISR();
+void send_thread(uint8_t code, uint64_t data);
+void print_thread(void);
+void decode_instruction(char* input);
+void decode_thread(void);
+void motorCtrlTick();
+void motorCtrlFn();
+void computationRate(float startTime, float elapsedTime, int counter);
+
+
 
 //Set a given drive state
 void motorOut(int8_t driveState, uint64_t torque){
@@ -193,7 +208,7 @@ void motorPosition() {
     intState = readRotorState();
     stateChange = intState - intStateOld;
     if (intState != intStateOld) {
-        motorOut((intState-orState+lead+6)%6,torque_speed); //+6 to make sure the remainder is positive
+        motorOut((intState-orState+lead+6)%6,output_torque); //+6 to make sure the remainder is positive
         if(intState - intStateOld == 5) interruptCount++;
         else if (intState - intStateOld == -5) interruptCount--;
         else interruptCount += (intState - intStateOld);
@@ -246,7 +261,7 @@ void print_thread(void) {
                     break;
                 case ROTATIONS: // PD position control
                     pc.printf("Position thread accessed\n\r");
-                    pc.printf("target pos =\t%.3f\n\r", target_position);
+                    pc.printf("target pos =\t%.3f\n\r", p_max);
             }
             
         mail_box.free(mail);
@@ -271,9 +286,10 @@ void decode_instruction(char* input){
     else if(input[0] == 'R'){
         input_mutex.lock();
         // expected input of format V\d{1,3}(\.\d{1,3})?
-        sscanf(input,"R%f", &target_position);
+        sscanf(input,"R%f", &p_max);
+        interruptCount = 0;
         input_mutex.unlock();
-        send_thread(ROTATIONS, target_position);
+        send_thread(ROTATIONS, p_max);
     }
 }
 
@@ -310,13 +326,14 @@ void motorCtrlFn(){
 
     int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
     int64_t Kpr = 25;   // proportional constant for rotation controller
-    int64_t Kdr = 25;   // derivative constant for rotation controller
-    int state_change_count = 0;
-    float current_position;
+    int64_t Kdr = 35;   // derivative constant for rotation controller
+    float state_change_count = 0;
     float currentS = 0;     // absolute value of current speed
     float es = 0;            // speed error  
-    float er;         // rotation error
+    float er = 0;         // rotation error
     float er_derivative = 0;
+    static float old_state_change_count = 0;
+    static float er_prev;
     // previous rotation error
 
     while(true){
@@ -325,83 +342,84 @@ void motorCtrlFn(){
         
         // calculate velocity and position change
         state_change_count = interruptCount;
-        current_position = state_change_count / 6;
-        // local copy 
+        float position = state_change_count / 6; // determine current rotation position
         float velocity = (state_change_count - old_state_change_count) * 10; // determine number of interrupts (number of state changes) per second
         old_state_change_count = state_change_count;
-        current_velocity = velocity;
+        current_velocity = velocity; // write current velocity to global copy
 
         // PD position torque controller: Tp = Kpr * er + Kdr * d/dt(er)
-        er = target_position - current_position; // position error
+        float target_position = p_max; 
+        er = target_position - position; // position error
         er_derivative = er - er_prev; // time derivative of position error
         er_prev = er;
-        Tp = Kpr * er + Kdr * er_derivative; // position torque
 
         float target_speed = s_max * 6; // target speed in interrupts / sec - overwritten each time
         currentS = abs(velocity); // absolute value of speed
         es = target_speed - currentS; // speed error
 
-        // P velocity torque controller: Ts = (Kps * es) * sgn (er_derivative) CHECK only if not V0 (max speed) or R0 (endless rotation)
-        if(target_speed == 0) T = pwm_period; // set max torque for V0
-        else if(target_position == 0) T = (Kps * es); // torque
-        else T = (Kps * es) * sgn(er);
+        current_position = position;
 
-        if(T < 0){
-            pc.printf("hi\n\r");
-            torque_speed = -T; // negative values need to be made positive
+        // P velocity torque controller: Ts = (Kps * es) * sgn (er_derivative) CHECK only if not V0 (max speed) or R0 (endless rotation)
+        if (target_position == 0) // R0
+        {
+            if (target_speed == 0) // V0
+            {
+                torque_speed = pwm_period;
+            }
+            else
+            {
+                torque_speed = (Kps * es);
+            } 
+            output_torque = torque_speed;        
+        }
+        else
+        {
+            if(target_speed == 0) // V0
+            {
+                torque_speed = pwm_period;
+            }
+            else
+            {
+                torque_speed = (Kps * es);
+            }
+            torque_position = Kpr * er + Kdr * er_derivative;
+
+            if(er < 0) torque_speed = -torque_speed; // only change when moving backwards
+            
+            if((velocity < 0) && (torque_speed > torque_position))
+            {
+                output_torque = torque_speed, torque_position);
+            }
+            else
+            {
+                output_torque = min(torque_speed, torque_position);
+            }
+        }
+
+
+        if(output_torque < 0){
+            output_torque = -output_torque; // negative values need to be made positive
             lead = -2; // backwards rotation
         } 
         else{
-            torque_speed = T;
             lead = 2; // forwards rotation
         }
     
-        if(torque_speed > (pwm_period)) torque_speed = pwm_period;
+        if(output_torque > (pwm_period)) output_torque = pwm_period;
 
         if(iterCount == 10){
-            //revCount = interruptCount / 6;
-            pc.printf("v: \t%.3f\n\r", velocity / 6);
-            pc.printf("T: %d\n\r", torque_speed);
-            pc.printf("TARGET v: \t%.3f\n\r", target_speed / 6);
-           // interruptCount = 0;
+            pc.printf("v: %.3f\n\r", velocity / 6);
+            pc.printf("T: %d\n\r", output_torque);
+            pc.printf("TARGET v: %.3f\n\r", target_speed / 6);
+            pc.printf("p: %.3f\n\r", position);
+            pc.printf("TARGET p: %.3f\n\r", target_position);
+            pc.printf("Remaining: %.3f\n\r", er);
 
             iterCount = 0;
         }
 
-
-        motorOut((intState-orState+lead+6)%6, torque_speed); // write to motor output with new torque
-
-
-        /*
-
-        if(Tp < 0){
-            pc.printf("hi\n\r");
-            torque_position = -Tp; // negative values need to be made positive
-            lead = -2; // backwards rotation
-        } 
-        else{
-            torque_position = Tp;
-            lead = 2; // forwards rotation
-        }
-
-        if(torque_position > pwm_period) torque_position = pwm_period;
-
-        if(iterCount == 10){
-            //revCount = interruptCount / 6;
-            pc.printf("p: %d\n\r", current_position);
-            pc.printf("T: %d\n\r", torque_position);
-            pc.printf("TARGET p: %d\n\r", target_position);
-            pc.printf("Remaining: %d\n\r", er);
-           // interruptCount = 0;
-
-            iterCount = 0;
-        }
-
-        if(current_position == target_position) current_position = 0;
-
-        motorOut((intState-orState+lead+6)%6, torque_position); */
-
-        
+        motorOut((intState-orState+lead+6)%6, output_torque); // write to motor output with new torque // MOVE LATER
+       
         core_util_critical_section_exit();
         motorPosition();
     }
@@ -427,6 +445,17 @@ int sgn(float x)
     else return 1;
 }
 
+float min(float x, float y)
+{
+    if(x < y) return x;
+    else return y;
+}
+
+float max(float x, float y)
+{
+    if(x > y) return x;
+    else return y;
+}
 //Main
 int main() {
     
