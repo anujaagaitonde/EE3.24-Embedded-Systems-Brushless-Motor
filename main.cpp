@@ -82,7 +82,7 @@ enum dataCode {
 //Mailbox structure
 typedef struct {
     uint8_t code;
-    int64_t data;    
+    uint64_t data;    
 } mail_t;
 
 //Initialise the serial port
@@ -126,13 +126,16 @@ int8_t orState = 0;
 int8_t intState = 0;
 int8_t intStateOld = 0;
 int8_t stateChange = 0;
-volatile int64_t velocity = 0;           // revolutions / sec
+
+// parameters modified by threads
+volatile float s_max = 0;              // user defined maximum velocity in revolutions / sec
+volatile float current_velocity = 0;           // current velocity in interrupts / sec
+// volatile float target_speed = 0;       // maximum velocity in interrupts / sec
+volatile float target_position = 0;    // user defined number of rotations
+
 int iterCount = 0;
 int interruptCount = 0;             // count number of interrupts
-float revCount = 0;             // count number of revolutions = interrupts / 6
-volatile int64_t target_speed = 0;             // target speed
-volatile int64_t target_position = 0;
-volatile int64_t s_max = 0;         // max speed in rev/s
+float revCount = 0;             // count number of revolutions = interrupts / 6       // max speed in rev/s
 
 uint64_t newKey;                    // key
 char inputKey[18];                   // setting rotation speed
@@ -239,11 +242,11 @@ void print_thread(void) {
                     break;
                 case VELOCITY: // proportional motor speed control
                     pc.printf("Vel thread accessed\n\r");
-                    pc.printf("target vel = %d\n\r", s_max);
+                    pc.printf("target vel =\t%.3f\n\r", s_max);
                     break;
                 case ROTATIONS: // PD position control
                     pc.printf("Position thread accessed\n\r");
-                    pc.printf("target pos = %d\n\r", target_position);
+                    pc.printf("target pos =\t%.3f\n\r", target_position);
             }
             
         mail_box.free(mail);
@@ -261,14 +264,14 @@ void decode_instruction(char* input){
     else if(input[0] == 'V'){
         input_mutex.lock();
         // expected input of format V\d{1,3}(\.\d{1,3})?
-        sscanf(input,"V%d", &s_max);
+        sscanf(input,"V%f", &s_max);
         input_mutex.unlock();
         send_thread(VELOCITY, s_max);
     }
     else if(input[0] == 'R'){
         input_mutex.lock();
         // expected input of format V\d{1,3}(\.\d{1,3})?
-        sscanf(input,"R%d", &target_position);
+        sscanf(input,"R%f", &target_position);
         input_mutex.unlock();
         send_thread(ROTATIONS, target_position);
     }
@@ -303,7 +306,6 @@ void motorCtrlFn(){
     // run every 100ms
     Ticker motorCtrlTicker; 
     motorCtrlTicker.attach_us(&motorCtrlTick,100000);  
-    uint32_t iterTime = 0;
 
 
     int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
@@ -311,8 +313,8 @@ void motorCtrlFn(){
     int64_t Kdr = 25;   // derivative constant for rotation controller
     int state_change_count = 0;
     float current_position;
-    int64_t currentS = 0;     // absolute value of current speed
-    int64_t es = 0;            // speed error  
+    float currentS = 0;     // absolute value of current speed
+    float es = 0;            // speed error  
     float er;         // rotation error
     float er_derivative = 0;
     // previous rotation error
@@ -321,19 +323,25 @@ void motorCtrlFn(){
         motorCtrlT.signal_wait(0x1);
         core_util_critical_section_enter(); // temporarily disable interrupts
         
+        // calculate velocity and position change
         state_change_count = interruptCount;
         current_position = state_change_count / 6;
-        velocity = (state_change_count - old_state_change_count) * 10; // determine interrupts (number of state changes) per second
+        // local copy 
+        float velocity = (state_change_count - old_state_change_count) * 10; // determine number of interrupts (number of state changes) per second
         old_state_change_count = state_change_count;
+        current_velocity = velocity;
 
+        // PD position torque controller: Tp = Kpr * er + Kdr * d/dt(er)
         er = target_position - current_position; // position error
         er_derivative = er - er_prev; // time derivative of position error
         er_prev = er;
         Tp = Kpr * er + Kdr * er_derivative; // position torque
 
+        float target_speed = s_max * 6; // target speed in interrupts / sec - overwritten each time
         currentS = abs(velocity); // absolute value of speed
         es = target_speed - currentS; // speed error
 
+        // P velocity torque controller: Ts = (Kps * es) * sgn (er_derivative) CHECK only if not V0 (max speed) or R0 (endless rotation)
         if(target_speed == 0) T = pwm_period; // set max torque for V0
         else if(target_position == 0) T = (Kps * es); // torque
         else T = (Kps * es) * sgn(er);
@@ -352,9 +360,9 @@ void motorCtrlFn(){
 
         if(iterCount == 10){
             //revCount = interruptCount / 6;
-            pc.printf("v: %d\n\r", velocity / 6);
+            pc.printf("v: \t%.3f\n\r", velocity / 6);
             pc.printf("T: %d\n\r", torque_speed);
-            pc.printf("TARGET v: %d\n\r", target_speed / 6);
+            pc.printf("TARGET v: \t%.3f\n\r", target_speed / 6);
            // interruptCount = 0;
 
             iterCount = 0;
