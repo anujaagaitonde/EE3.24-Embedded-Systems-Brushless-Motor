@@ -119,8 +119,8 @@ Queue<void, 8> inCharQ; // declare queue instance
 Mail<mail_t, 16> mail_box; // declare mail instance
 
 // PI Speed Controller Parameters
-#define Kps 30      // proportional constant
-#define Kis 0     // integral constant - to reduce steady state error
+#define Kps 22       // proportional constant
+#define Kis 0.15   // integral constant - to reduce steady state error
 
 // PD Position Controller Parameters
 #define Kpr 25      // proportional constant
@@ -152,9 +152,9 @@ float revCount = 0;             // count number of revolutions = interrupts / 6 
 
 volatile uint64_t newKey;                    // key
 char inputKey[18];                   // setting rotation speed
-int64_t torque_speed = 1000;                      // speed torque
-int64_t output_torque = 1000;                 // output torque             
-int64_t torque_position = 1000;        // position torque
+int64_t torque_speed = pwm_period;                      // speed torque
+int64_t output_torque = pwm_period;                 // output torque             
+int64_t torque_position = pwm_period;        // position torque
 // int old_state_change_count;
 float er_prev;    // previous rotation error
 
@@ -350,7 +350,7 @@ void motorCtrlFn(){
 
     float state_change_count = 0;
     float currentS = 0;     // absolute value of current speed
-    float es = 0;            // speed error  
+    float es;            // speed error  
     static float es_integral = 0; // integral of speed error
     float er = 0;         // rotation error
     float er_derivative = 0;
@@ -381,6 +381,8 @@ void motorCtrlFn(){
         current_position = position;
         current_er = er;
 
+        //int32_t diff = (1.0502)*target_speed + 0.62;
+
         // P velocity torque controller: Ts = (Kps * es) * sgn (er_derivative)
         // PD position torque controller: Ts = Kpr * er + Kdr * er_derivative
         if (target_position == 0) // R0
@@ -391,7 +393,7 @@ void motorCtrlFn(){
             }
             else
             {
-                torque_speed = (Kps * es + Kis * es_integral);
+                torque_speed = (int64_t)(Kps * es - Kis * es_integral);
             } 
             output_torque = torque_speed;        
         }
@@ -403,9 +405,9 @@ void motorCtrlFn(){
             }
             else
             {
-                torque_speed = (Kps * es + Kis * es_integral);
+                torque_speed = (int64_t)(Kps * es - Kis * es_integral);
             }
-            torque_position = Kpr * er + Kdr * er_derivative;
+            torque_position = (int64_t) (Kpr * er + Kdr * er_derivative);
 
             if(er < 0) torque_speed = -torque_speed; // only change when moving backwards - implements sgn function
             
@@ -419,9 +421,14 @@ void motorCtrlFn(){
             }
         }
 
-        es_integral += es; // integral = summation of all previous values of es
+        if(output_torque == torque_position) es_integral = 0;
+        else
+        {
+            if(es_integral >=  30 * target_speed) es_integral = target_speed * 30; // anti-windup
+            else if(es_integral <=  -(30 * target_speed)) es_integral = -(target_speed * 30); // anti-windup
+            else es_integral += es;
+        }
 
-        if(output_torque == torque_position) es_integral = 0; // reset speed integral if position controller is used
 
         if(output_torque > (pwm_period)) output_torque = pwm_period;
 
@@ -438,18 +445,19 @@ void motorCtrlFn(){
         core_util_critical_section_exit(); // re-enable interrupts
         if(iterCount == 10){ // display current velocity and position data every 1s
             send_thread(VELOCITY, (velocity/6));
-            send_thread(POSITION, position);
+            pc.printf("es_integral %f\n\r", es_integral);
+           // send_thread(POSITION, position);
             iterCount = 0;
         }
 
-        if(velocity == 0) motorPosition();
+        motorPosition();
     }
 }
 
 void computationRate(float elapsedTime, int computation_counter){ // calculate hash computation rate
     
     if(elapsedTime >= 1){
-        send_thread(HASHRATE, computation_counter);
+        //send_thread(HASHRATE, computation_counter);
         t.reset();
         computation_counter = 0;
     } 
@@ -518,7 +526,7 @@ int main() {
         //Test for both hash[0] and hash[1] equal to zero to indicate a successful ‘nonce’
         if(hash[0] == 0 &&  hash[1] == 0) 
         {
-            send_thread(NONCE, *nonce);
+           // send_thread(NONCE, *nonce);
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
