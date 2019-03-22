@@ -264,11 +264,6 @@ void print_thread(void) {
                     break;
                 case NONCE:
                     pc.printf("Found a nonce = 0x%016x\n\r", mail -> data);
-                    // uint64_t receivedNonce = mail->data;
-                    // for(int i = 0; i < 8; ++i){
-                    //     pc.printf("%02x ", (((uint8_t*)receivedNonce)[i]));
-                    // }
-                    // pc.printf("\n\r");
                     break;
                 case TARGETVELOCITY: // proportional motor speed control
                     pc.printf("Target Velocity = %.3f\n\r", s_max);
@@ -463,7 +458,7 @@ void motorCtrlFn(){
 void computationRate(float elapsedTime, int computation_counter){
     
     if(elapsedTime >= 1){
-        send_thread(HASHRATE, computation_counter);
+        send_thread(HASHRATE, computation_counter/elapsedTime);
         t.reset();
         computation_counter = 0;
     } 
@@ -523,19 +518,24 @@ int main() {
         //sequence now contains the new key
         sha256.computeHash(hash, sequence, 64);
         computation_counter++;
+
+        if(t.read >= 1)
+        {
+            send_thread(HASHRATE, computation_counter);
+        }
+
+        float elapsedTime = t.read();   
         
         //Test for both hash[0] and hash[1] equal to zero to indicate a successful ‘nonce’
         if(hash[0] == 0 &&  hash[1] == 0) 
         {
-           // send_thread(NONCE, *nonce);
+        send_thread(NONCE, *nonce);
         }
         
         //There is no efficient method for searching for the ‘nonce’, so just start at zero and increment by one on each attempt
         (*nonce)++;
 
         //Every second, report the current computation rate
-        float elapsedTime = t.read();
-        computationRate(elapsedTime, computation_counter);   
     }
 }
 
