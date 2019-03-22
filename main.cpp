@@ -111,17 +111,25 @@ PwmOut L3L(L3Lpin);
 DigitalOut L3H(L3Hpin);
 
 //Thread initialisations
-Thread thread; // declare stack size?
+Thread thread; // declare stack size
 Thread inputThread; // declare stack size?
 Thread motorCtrlT(osPriorityNormal,1024);
 
-Queue<void, 8> inCharQ;
-Mail<mail_t, 16> mail_box;
+Queue<void, 8> inCharQ; // declare queue instance
+Mail<mail_t, 16> mail_box; // declare mail instance
+
+// PI Speed Controller Parameters
+#define Kps 30      // proportional constant
+#define Kis 0     // integral constant - to reduce steady state error
+
+// PD Position Controller Parameters
+#define Kpr 25      // proportional constant
+#define Kdr 50      // derivative constant
 
 Timer t; //MBED timer class
 
 //PwmOut motor(PWMpin); // PWMOut class
-int64_t pwm_period = 2000; // PWM period is us
+#define pwm_period 2000 // PWM period is us
 
 Mutex input_mutex; // use mutex to prevent simultaneous access
 
@@ -298,7 +306,7 @@ void decode_instruction(char* input){
         // expected input of format V\d{1,3}(\.\d{1,3})?
         sscanf(input,"V%f", &s_max);
         input_mutex.unlock();
-        send_thread(VELOCITY, s_max);
+        send_thread(TARGETVELOCITY, s_max);
     }
     else if(input[0] == 'R'){
         input_mutex.lock();
@@ -340,18 +348,14 @@ void motorCtrlFn(){
     Ticker motorCtrlTicker; 
     motorCtrlTicker.attach_us(&motorCtrlTick,100000);  
 
-
-    int64_t Kps = 25;   // proportional constant for speed controller - maximum to avoid oscillation
-    int64_t Kpr = 25;   // proportional constant for rotation controller
-    int64_t Kdr = 50;   // derivative constant for rotation controller
     float state_change_count = 0;
     float currentS = 0;     // absolute value of current speed
     float es = 0;            // speed error  
+    static float es_integral = 0; // integral of speed error
     float er = 0;         // rotation error
     float er_derivative = 0;
     static float old_state_change_count = 0;
-    static float er_prev;
-    // previous rotation error
+    static float er_prev; // previous rotation error
 
     while(true){
         motorCtrlT.signal_wait(0x1);
@@ -387,7 +391,7 @@ void motorCtrlFn(){
             }
             else
             {
-                torque_speed = (Kps * es);
+                torque_speed = (Kps * es + Kis * es_integral);
             } 
             output_torque = torque_speed;        
         }
@@ -399,11 +403,11 @@ void motorCtrlFn(){
             }
             else
             {
-                torque_speed = (Kps * es);
+                torque_speed = (Kps * es + Kis * es_integral);
             }
             torque_position = Kpr * er + Kdr * er_derivative;
 
-            if(er < 0) torque_speed = -torque_speed; // only change when moving backwards
+            if(er < 0) torque_speed = -torque_speed; // only change when moving backwards - implements sgn function
             
             if((velocity < 0))
             {
@@ -415,6 +419,12 @@ void motorCtrlFn(){
             }
         }
 
+        es_integral += es; // integral = summation of all previous values of es
+
+        if(output_torque == torque_position) es_integral = 0; // reset speed integral if position controller is used
+
+        if(output_torque > (pwm_period)) output_torque = pwm_period;
+
 
         if(output_torque < 0){
             output_torque = -output_torque; // negative values need to be made positive
@@ -423,10 +433,7 @@ void motorCtrlFn(){
         else{
             lead = 2; // forwards rotation
         }
-    
-        if(output_torque > (pwm_period)) output_torque = pwm_period;
-
-        motorOut((intState-orState+lead+6)%6, output_torque); // write to motor output with new torque // MOVE LATER
+        
        
         core_util_critical_section_exit(); // re-enable interrupts
         if(iterCount == 10){ // display current velocity and position data every 1s
@@ -434,14 +441,15 @@ void motorCtrlFn(){
             send_thread(POSITION, position);
             iterCount = 0;
         }
-        motorPosition();
+
+        if(velocity == 0) motorPosition();
     }
 }
 
 void computationRate(float elapsedTime, int computation_counter){ // calculate hash computation rate
     
     if(elapsedTime >= 1){
-        send_thread(HASHRATE, computation_count)
+        send_thread(HASHRATE, computation_counter);
         t.reset();
         computation_counter = 0;
     } 
@@ -470,14 +478,10 @@ int main() {
     pc.printf("\n");
     pc.printf("Hello\n\r");
 
-    // 2ms period
-   // motor.period_us(pwm_period);     
+    // 2ms period 
     L1L.period_us(pwm_period);
     L2L.period_us(pwm_period);
     L3L.period_us(pwm_period);
-    L1L.write(100.0);
-    L2L.write(100.0);
-    L3L.write(100.0);
     //motor.write(0.50f);       // 50% duty cycle, relative to period
    // motor.write(100.0);       // 100% duty cycle, relative to period
     
@@ -493,6 +497,8 @@ int main() {
     I1.fall(&motorPosition);
     I2.fall(&motorPosition);
     I3.fall(&motorPosition);
+
+    motorPosition();
     
     thread.start(callback(print_thread));
     inputThread.start(callback(decode_thread));
@@ -507,7 +513,7 @@ int main() {
         input_mutex.unlock();
         //sequence now contains the new key
         sha256.computeHash(hash, sequence, 64);
-        computation_count++;
+        computation_counter++;
         
         //Test for both hash[0] and hash[1] equal to zero to indicate a successful ‘nonce’
         if(hash[0] == 0 &&  hash[1] == 0) 
@@ -520,6 +526,7 @@ int main() {
 
         //Every second, report the current computation rate
         float elapsedTime = t.read();
-        computationRate(elapsedTime, computation_count);   
+        computationRate(elapsedTime, computation_counter);   
     }
 }
+
